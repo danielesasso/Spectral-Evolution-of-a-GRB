@@ -1,14 +1,15 @@
 # Gamma-Ray-Burst
 
-Struttura iniziale per un workspace dedicato all'analisi di Gamma-Ray Burst.
+Initial structure for a workspace dedicated to the analysis of Gamma-Ray Bursts.
 
-## Ambiente conda
+## Conda Environment
 
-Ambiente creato: `grb`
+Conda environment name: `grb`
 
-### Dipendenze da installare
+### Dependencies to Install
 
-Dipendenze principali usate nel progetto (allineate all'ambiente `grb`):
+Main dependencies used in the project (aligned with the `grb` environment):  
+
 - `python=3.11`
 - `numpy==1.24.2`
 - `pandas==2.0.0`
@@ -21,7 +22,7 @@ Dipendenze principali usate nel progetto (allineate all'ambiente `grb`):
 - `requests==2.29.0`
 - `ClassiPyGRB==1.0.0`
 
-Installazione consigliata:
+Recommended installation:
 
 ```bash
 conda create -n grb python=3.11 -y
@@ -30,7 +31,7 @@ conda install -c conda-forge numpy=1.24.2 pandas=2.0.0 matplotlib=3.7.1 scipy=1.
 pip install ClassiPyGRB==1.0.0
 ```
 
-## Struttura
+## Project Structure
 
 ```text
 Gamma-Ray-Burst/
@@ -46,21 +47,21 @@ Gamma-Ray-Burst/
 └── README.md
 ```
 
-## Uso rapido
+## A quick start:
 
-Attiva l'ambiente:
+Activate the environment:
 
 ```bash
 conda activate grb
 ```
 
-Esegui lo script principale:
+Run the main script with:
 
 ```bash
 python3 main.py
 ```
 
-## Licenza
+## License
 
-Questo progetto e distribuito sotto licenza MIT.
-Per i dettagli completi, vedi il file `LICENSE`.
+This project is distributed under the MIT License.  
+For full details, see the `LICENSE` file.
