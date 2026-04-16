@@ -1,83 +1,74 @@
-from typing import Iterable
+from pathlib import Path
+
+import h5py
 import torch
-from ClassiPyGRB import SWIFT
 from torch import nn
 from torch.utils.data import Dataset
 
-from functions import extract_t90, make_t90_lookup, resample_light_curve, zscore_per_grb
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = None
-
-
-class GRBDataset(Dataset):
+class GRBHDF5Dataset(Dataset):
     """
-    PyTorch dataset for binary short/long GRB classification.
+    PyTorch dataset backed by the local ClassiPyGRB HDF5 cache.
 
-    Output:
-        X: float tensor shaped (time, channels)
-        y: float tensor scalar, 0.0 for short and 1.0 for long (T90 > 2 s)
+    Expected HDF5 datasets:
+        X: float array shaped (n_grbs, time, channels)
+        y: binary labels, 0.0 for short and 1.0 for long
+        names: GRB names
+        t90: T90 durations
     """
 
-    def __init__(
-        self,
-        grb_names: Iterable[str],
-        channel_columns: list[str],
-        time_column: str,
-        target_length: int,
-        swift_resolution: int,
-        normalize: str,
-        skip_bad: bool,
-    ) -> None:
-        self.grb_names = list(grb_names)
-        self.channel_columns = channel_columns
-        self.time_column = time_column
-        self.target_length = target_length
-        self.swift = SWIFT(res=swift_resolution)
-        self.t90_lookup = make_t90_lookup(self.swift.summary_table())
-        self.samples: list[tuple[torch.Tensor, torch.Tensor, str, float]] = []
-        self.skipped: list[tuple[str, str]] = []
+    def __init__(self, h5_file: str | Path) -> None:
+        self.h5_file = Path(h5_file)
+        if not self.h5_file.exists():
+            raise FileNotFoundError(f"HDF5 file not found: {self.h5_file}")
 
-        if normalize != "zscore":
-            raise ValueError("Only per-GRB zscore normalization is currently implemented")
+        with h5py.File(self.h5_file, "r") as h5:
+            required_datasets = {"X", "y", "names", "t90"}
+            missing = required_datasets.difference(h5.keys())
+            if missing:
+                raise ValueError(f"HDF5 file is missing datasets: {sorted(missing)}")
 
-        grb_iterator = self.grb_names
-        if tqdm is not None:
-            grb_iterator = tqdm(self.grb_names, desc="Loading GRBs", unit="GRB")
+            self.x = torch.tensor(h5["X"][:], dtype=torch.float32)
+            self.y = torch.tensor(h5["y"][:], dtype=torch.float32)
+            self.names = [decode_h5_string(name) for name in h5["names"][:]]
+            self.t90 = [float(value) for value in h5["t90"][:]]
 
-        for name in grb_iterator:
-            try:
-                df = self.swift.obtain_data(name=name)
-                if not hasattr(df, "columns"):
-                    raise RuntimeError(str(df))
-                t90 = extract_t90(df, grb_name=name, t90_lookup=self.t90_lookup)
-                signal = resample_light_curve(
-                    df,
-                    target_length=target_length,
-                    channel_columns=channel_columns,
-                    time_column=time_column,
-                )
-                signal = zscore_per_grb(signal)
-                label = 1.0 if t90 > 2.0 else 0.0
-                x = torch.tensor(signal, dtype=torch.float32)
-                y = torch.tensor(label, dtype=torch.float32)
-                self.samples.append((x, y, name, t90))
-            except Exception as exc:
-                if not skip_bad:
-                    raise
-                self.skipped.append((name, str(exc)))
+            if "channel_columns" in h5:
+                self.channel_columns = [
+                    decode_h5_string(channel) for channel in h5["channel_columns"][:]
+                ]
+            else:
+                self.channel_columns = [f"channel_{idx}" for idx in range(self.x.shape[2])]
 
-        if not self.samples:
-            raise RuntimeError("No valid GRBs were loaded. Check names, columns, and T90 metadata.")
+            self.label_rule = str(h5.attrs.get("label_rule", "0 short, 1 long"))
+            self.cache_normalization = str(h5.attrs.get("normalize", "unknown"))
+
+        if self.x.ndim != 3:
+            raise ValueError(f"Expected X to have shape (n, time, channels), got {tuple(self.x.shape)}")
+        if len(self.x) != len(self.y):
+            raise ValueError("X and y contain different numbers of GRBs")
+
+        self.labels = [int(value.item()) for value in self.y]
+        self.samples = [
+            (self.x[idx], self.y[idx], self.names[idx], self.t90[idx])
+            for idx in range(len(self.y))
+        ]
+
+    @property
+    def num_channels(self) -> int:
+        return int(self.x.shape[2])
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.y)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x, y, _, _ = self.samples[idx]
-        return x, y
+        return self.x[idx], self.y[idx]
+
+
+def decode_h5_string(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
 
 
 class GRBConvNet(nn.Module):
@@ -87,19 +78,22 @@ class GRBConvNet(nn.Module):
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv1d(channels, hidden, kernel_size=7, padding=3),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
             nn.Conv1d(hidden, hidden * 2, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden * 2),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(hidden * 2, hidden * 2, kernel_size=3, padding=1),
+            nn.Conv1d(hidden * 2, hidden * 4, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden * 4),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(dropout),
-            nn.Linear(hidden * 2, 1),
+            nn.Linear(hidden * 4, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

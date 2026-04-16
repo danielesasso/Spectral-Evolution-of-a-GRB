@@ -1,6 +1,5 @@
 import copy
 import random
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -13,7 +12,7 @@ try:
 except ImportError:
     tqdm = None
 
-# seed
+# main.py: reproducibility and device selection
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -21,53 +20,14 @@ def set_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# uso di mps
+
 def get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
-def load_grb_names(
-    names: list[str] | None,
-    names_file: str | Path | None,
-    default_grb_names: list[str],
-) -> list[str]:
-    """Load GRB names from CLI values, a text file, or a CSV file."""
-    loaded_names: list[str] = []
-
-    if names:
-        loaded_names.extend(names)
-
-    if names_file:
-        path = Path(names_file)
-        if not path.exists():
-            raise FileNotFoundError(f"Names file not found: {path}")
-
-        if path.suffix.lower() == ".csv":
-            table = pd.read_csv(path)
-            candidate_columns = ["name", "grb", "GRB", "grb_name", "GRB_name"]
-            name_column = next((col for col in candidate_columns if col in table.columns), None)
-            if name_column is None:
-                raise ValueError(
-                    f"CSV names file must contain one of these columns: {candidate_columns}"
-                )
-            loaded_names.extend(table[name_column].dropna().astype(str).tolist())
-        else:
-            loaded_names.extend(
-                line.strip() for line in path.read_text().splitlines() if line.strip()
-            )
-
-    cleaned = []
-    seen = set()
-    for name in loaded_names or default_grb_names:
-        name = str(name).strip()
-        if name and name not in seen:
-            cleaned.append(name)
-            seen.add(name)
-    return cleaned
-
-
+# testing_files/*.py: Swift metadata and raw light-curve extraction
 def make_t90_lookup(summary_table: pd.DataFrame) -> dict[str, float]:
     """Create a GRB name -> T90 lookup from the ClassiPyGRB Swift summary table."""
     required_columns = {"GRBname", "T90"}
@@ -107,15 +67,7 @@ def extract_t90(
     raise ValueError("No finite T90 value found")
 
 
-def zscore_per_grb(signal: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """Normalize each channel inside one GRB only; no global leakage."""
-    mean = np.nanmean(signal, axis=0, keepdims=True)
-    std = np.nanstd(signal, axis=0, keepdims=True)
-    std = np.where(std < eps, 1.0, std)
-    normalized = (signal - mean) / std
-    return np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
-
-
+# shared preprocessing helpers: fixed-length conversion from variable-length curves
 def pad_or_truncate(signal: np.ndarray, target_length: int) -> np.ndarray:
     """Keep temporal order and pad short curves with zeros at the end."""
     if signal.shape[0] >= target_length:
@@ -124,6 +76,44 @@ def pad_or_truncate(signal: np.ndarray, target_length: int) -> np.ndarray:
     padded = np.zeros((target_length, signal.shape[1]), dtype=np.float32)
     padded[: signal.shape[0]] = signal
     return padded
+
+
+def extract_light_curve_arrays(
+    df: pd.DataFrame,
+    channel_columns: list[str],
+    time_column: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extract variable-length light-curve arrays without padding, truncation, or resampling.
+
+    This is intended for the raw HDF5 cache. Fixed-shape conversion should happen
+    later, right before analysis/training.
+    """
+    missing_channels = [col for col in channel_columns if col not in df.columns]
+    if missing_channels:
+        raise ValueError(f"Missing rate columns: {missing_channels}")
+
+    rates = df[channel_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
+    if rates.size == 0:
+        raise ValueError("Empty light curve")
+
+    if time_column in df.columns:
+        time = pd.to_numeric(df[time_column], errors="coerce").to_numpy(dtype=np.float64)
+    else:
+        time = np.arange(rates.shape[0], dtype=np.float64)
+
+    valid_rows = np.isfinite(time)
+    if valid_rows.sum() == 0:
+        raise ValueError("No finite time values found")
+
+    time = time[valid_rows]
+    rates = rates[valid_rows]
+    order = np.argsort(time)
+    time = time[order]
+    rates = rates[order]
+
+    unique_time, unique_idx = np.unique(time, return_index=True)
+    return unique_time.astype(np.float64), rates[unique_idx].astype(np.float32)
 
 
 def resample_light_curve(
@@ -183,47 +173,88 @@ def resample_light_curve(
     return np.stack(resampled_channels, axis=1)
 
 
-def split_dataset(
+# main.py: fold creation and DataLoader setup
+def dataset_labels(dataset: Dataset) -> list[int] | None:
+    """Return binary labels without triggering item loading when possible."""
+    samples = getattr(dataset, "samples", None)
+    if samples is None:
+        return None
+
+    labels: list[int] = []
+    for sample in samples:
+        label = sample[1]
+        labels.append(int(float(label.item() if hasattr(label, "item") else label)))
+    return labels
+
+
+def make_stratified_folds(dataset: Dataset, k_folds: int, seed: int) -> list[list[int]]:
+    """Create class-balanced folds for cross-validation."""
+    if k_folds < 3:
+        raise ValueError("Need at least 3 folds so train, validation, and test are separate")
+
+    labels = dataset_labels(dataset)
+    if labels is None or len(set(labels)) < 2:
+        raise ValueError("Stratified k-fold requires binary labels on the dataset")
+
+    rng = random.Random(seed)
+    by_class: dict[int, list[int]] = {}
+    for idx, label in enumerate(labels):
+        by_class.setdefault(int(label), []).append(idx)
+
+    min_class_count = min(len(indices) for indices in by_class.values())
+    if k_folds > min_class_count:
+        raise ValueError(
+            f"k_folds={k_folds} is too large for the smallest class ({min_class_count} samples)"
+        )
+
+    folds = [[] for _ in range(k_folds)]
+    for class_indices in by_class.values():
+        rng.shuffle(class_indices)
+        for item_idx, dataset_idx in enumerate(class_indices):
+            folds[item_idx % k_folds].append(dataset_idx)
+
+    for fold in folds:
+        rng.shuffle(fold)
+    return folds
+
+
+def make_fold_dataloaders(
     dataset: Dataset,
-    train_ratio: float,
-    val_ratio: float,
-    seed: int,
-) -> tuple[Subset, Subset, Subset]:
-    """Random split after preprocessing; set seed for reproducibility."""
-    n = len(dataset)
-    if n < 3:
-        raise ValueError("Need at least 3 valid labeled GRBs for train/val/test splits")
-
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(n, generator=generator).tolist()
-
-    train_size = max(1, int(n * train_ratio))
-    val_size = max(1, int(n * val_ratio))
-    if train_size + val_size >= n:
-        train_size = n - 2
-        val_size = 1
-
-    train_idx = indices[:train_size]
-    val_idx = indices[train_size : train_size + val_size]
-    test_idx = indices[train_size + val_size :]
-
-    return Subset(dataset, train_idx), Subset(dataset, val_idx), Subset(dataset, test_idx)
-
-
-def make_dataloaders(
-    dataset: Dataset,
+    folds: list[list[int]],
+    fold_idx: int,
     batch_size: int,
     seed: int,
     num_workers: int,
-    train_ratio: float,
-    val_ratio: float,
+    global_normalize: bool,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    train_set, val_set, test_set = split_dataset(
-        dataset,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        seed=seed,
-    )
+    """Use one fold for test, the next fold for validation, and the rest for training."""
+    if not folds:
+        raise ValueError("folds cannot be empty")
+
+    fold_count = len(folds)
+    test_fold = fold_idx % fold_count
+    val_fold = (fold_idx + 1) % fold_count
+    train_idx = [
+        dataset_idx
+        for current_fold, fold in enumerate(folds)
+        if current_fold not in {test_fold, val_fold}
+        for dataset_idx in fold
+    ]
+    rng = random.Random(seed + fold_idx)
+    rng.shuffle(train_idx)
+
+    if global_normalize:
+        train_set, val_set, test_set = make_global_normalized_subsets(
+            dataset,
+            train_idx=train_idx,
+            val_idx=folds[val_fold],
+            test_idx=folds[test_fold],
+        )
+    else:
+        train_set = Subset(dataset, train_idx)
+        val_set = Subset(dataset, folds[val_fold])
+        test_set = Subset(dataset, folds[test_fold])
+
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -236,8 +267,58 @@ def make_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-def binary_counts(logits: torch.Tensor, targets: torch.Tensor) -> tuple[int, int, int, int]:
-    preds = (torch.sigmoid(logits) >= 0.5).long()
+def make_global_normalized_subsets(
+    dataset: Dataset,
+    train_idx: list[int],
+    val_idx: list[int],
+    test_idx: list[int],
+    eps: float = 1e-6,
+) -> tuple[Dataset, Dataset, Dataset]:
+    """Normalize X with mean/std computed from training GRBs only."""
+    x_values = getattr(dataset, "x", None)
+    if x_values is None:
+        raise ValueError("Global normalization requires the dataset to expose an x tensor")
+
+    train_x = x_values[train_idx]
+    mean = train_x.mean(dim=(0, 1)).view(1, -1)
+    std = train_x.std(dim=(0, 1), unbiased=False).view(1, -1)
+    std = torch.where(std < eps, torch.ones_like(std), std)
+
+    return (
+        GlobalNormalizedSubset(dataset, train_idx, mean, std),
+        GlobalNormalizedSubset(dataset, val_idx, mean, std),
+        GlobalNormalizedSubset(dataset, test_idx, mean, std),
+    )
+
+
+class GlobalNormalizedSubset(Dataset):
+    def __init__(
+        self,
+        dataset: Dataset,
+        indices: list[int],
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> None:
+        self.dataset = dataset
+        self.indices = indices
+        self.mean = mean
+        self.std = std
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.dataset[self.indices[idx]]
+        return (x - self.mean) / self.std, y
+
+
+# main.py: training and evaluation helpers
+def binary_counts(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    threshold: float = 0.5,
+) -> tuple[int, int, int, int]:
+    preds = (torch.sigmoid(logits) >= threshold).long()
     labels = targets.long()
     tp = int(((preds == 1) & (labels == 1)).sum().item())
     tn = int(((preds == 0) & (labels == 0)).sum().item())
@@ -271,6 +352,7 @@ def run_epoch(
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     description: str | None = None,
+    threshold: float = 0.5,
 ) -> tuple[float, dict[str, float]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -302,7 +384,11 @@ def run_epoch(
             batch_size = y.size(0)
             total_loss += float(loss.item()) * batch_size
             total_examples += batch_size
-            batch_tp, batch_tn, batch_fp, batch_fn = binary_counts(logits.detach(), y.detach())
+            batch_tp, batch_tn, batch_fp, batch_fn = binary_counts(
+                logits.detach(),
+                y.detach(),
+                threshold=threshold,
+            )
             tp += batch_tp
             tn += batch_tn
             fp += batch_fp
@@ -328,12 +414,22 @@ def train_model(
     epochs: int,
     lr: float,
     device: torch.device,
+    weight_decay: float = 1e-3,
+    patience: int = 12,
 ) -> nn.Module:
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=max(1, patience // 3),
+    )
 
     best_state = copy.deepcopy(model.state_dict())
-    best_val_f1 = -1.0
+    best_val_loss = float("inf")
+    best_val_f1 = 0.0
+    epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
         train_loss, train_metrics = run_epoch(
@@ -352,29 +448,113 @@ def train_model(
             description=f"Epoch {epoch:03d}/{epochs:03d} val",
         )
 
-        if val_metrics["f1"] > best_val_f1:
+        scheduler.step(val_loss)
+
+        improved = val_loss < best_val_loss
+        if improved:
+            best_val_loss = val_loss
             best_val_f1 = val_metrics["f1"]
             best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train loss={train_loss:.4f} acc={train_metrics['accuracy']:.3f} "
-            f"f1={train_metrics['f1']:.3f} | "
-            f"val loss={val_loss:.4f} acc={val_metrics['accuracy']:.3f} "
-            f"f1={val_metrics['f1']:.3f}"
-        )
+        if epoch == 1 or epoch % 10 == 0 or epoch == epochs:
+            print(
+                f"Epoch {epoch:03d} | "
+                f"train loss={train_loss:.4f} acc={train_metrics['accuracy']:.3f} "
+                f"f1={train_metrics['f1']:.3f} | "
+                f"val loss={val_loss:.4f} acc={val_metrics['accuracy']:.3f} "
+                f"f1={val_metrics['f1']:.3f}"
+            )
+
+        if patience > 0 and epochs_without_improvement >= patience:
+            print(
+                f"Early stopping after {epoch} epochs; "
+                f"best val loss={best_val_loss:.4f} f1={best_val_f1:.3f}"
+            )
+            break
 
     model.load_state_dict(best_state)
     return model
 
-# valutazione e stampa metriche
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> None:
+
+def find_best_threshold(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    thresholds: np.ndarray | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Tune the decision threshold on validation data instead of assuming 0.5."""
+    if thresholds is None:
+        thresholds = np.linspace(0.05, 0.95, 91)
+
+    logits_list: list[torch.Tensor] = []
+    targets_list: list[torch.Tensor] = []
+    model.eval()
+    with torch.no_grad():
+        for x, y in loader:
+            logits_list.append(model(x.to(device)).detach().cpu())
+            targets_list.append(y.detach().cpu())
+
+    logits = torch.cat(logits_list)
+    targets = torch.cat(targets_list)
+
+    best_threshold = 0.5
+    best_metrics = metrics_from_counts(*binary_counts(logits, targets, threshold=best_threshold))
+    for threshold in thresholds:
+        metrics = metrics_from_counts(*binary_counts(logits, targets, threshold=float(threshold)))
+        if (
+            metrics["f1"] > best_metrics["f1"]
+            or (
+                metrics["f1"] == best_metrics["f1"]
+                and metrics["accuracy"] > best_metrics["accuracy"]
+            )
+        ):
+            best_threshold = float(threshold)
+            best_metrics = metrics
+
+    return best_threshold, best_metrics
+
+
+def collect_binary_label_counts(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+) -> tuple[int, int, int, int]:
+    model.eval()
+    true_short = true_long = pred_short = pred_long = 0
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            preds = (torch.sigmoid(logits) >= threshold).long()
+            labels = y.long()
+
+            true_short += int((labels == 0).sum().item())
+            true_long += int((labels == 1).sum().item())
+            pred_short += int((preds == 0).sum().item())
+            pred_long += int((preds == 1).sum().item())
+
+    return true_short, true_long, pred_short, pred_long
+
+
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+) -> tuple[float, dict[str, float]]:
     criterion = nn.BCEWithLogitsLoss()
-    loss, metrics = run_epoch(model, loader, criterion, device)
+    loss, metrics = run_epoch(model, loader, criterion, device, threshold=threshold)
     true_short, true_long, pred_short, pred_long = collect_binary_label_counts(
         model,
         loader,
         device,
+        threshold=threshold,
     )
 
     print("\nTest results")
@@ -383,6 +563,7 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -
     print(f"precision: {metrics['precision']:.3f}")
     print(f"recall: {metrics['recall']:.3f}")
     print(f"f1: {metrics['f1']:.3f}")
+    print(f"decision threshold: {threshold:.2f}")
     print("confusion matrix [[TN, FP], [FN, TP]]:")
     print(
         [
@@ -397,27 +578,4 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -
     print(f"short GRBs: {pred_short}")
     print(f"long GRBs: {pred_long}")
     print("label rule: short = T90 <= 2 seconds, long = T90 > 2 seconds")
-
-
-def collect_binary_label_counts(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> tuple[int, int, int, int]:
-    model.eval()
-    true_short = true_long = pred_short = pred_long = 0
-
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            logits = model(x)
-            preds = (torch.sigmoid(logits) >= 0.5).long()
-            labels = y.long()
-
-            true_short += int((labels == 0).sum().item())
-            true_long += int((labels == 1).sum().item())
-            pred_short += int((preds == 0).sum().item())
-            pred_long += int((preds == 1).sum().item())
-
-    return true_short, true_long, pred_short, pred_long
+    return loss, metrics
