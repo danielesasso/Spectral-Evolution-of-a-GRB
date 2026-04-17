@@ -189,3 +189,4 @@ testing_files/
 # Keep these out of git unless you intentionally decide to publish a dataset artifact.
 data/raw/classipygrb/*.h5
 data/raw/classipygrb/*.hdf5
+!data/raw/classipygrb/swift_balanced_lightcurves.h5

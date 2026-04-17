@@ -67,17 +67,6 @@ def extract_t90(
     raise ValueError("No finite T90 value found")
 
 
-# shared preprocessing helpers: fixed-length conversion from variable-length curves
-def pad_or_truncate(signal: np.ndarray, target_length: int) -> np.ndarray:
-    """Keep temporal order and pad short curves with zeros at the end."""
-    if signal.shape[0] >= target_length:
-        return signal[:target_length]
-
-    padded = np.zeros((target_length, signal.shape[1]), dtype=np.float32)
-    padded[: signal.shape[0]] = signal
-    return padded
-
-
 def extract_light_curve_arrays(
     df: pd.DataFrame,
     channel_columns: list[str],
@@ -114,63 +103,6 @@ def extract_light_curve_arrays(
 
     unique_time, unique_idx = np.unique(time, return_index=True)
     return unique_time.astype(np.float64), rates[unique_idx].astype(np.float32)
-
-
-def resample_light_curve(
-    df: pd.DataFrame,
-    target_length: int,
-    channel_columns: list[str],
-    time_column: str,
-) -> np.ndarray:
-    """
-    Convert variable-length multiband Swift curves to (target_length, channels).
-
-    Assumption: when a valid time column exists, interpolation onto an evenly
-    spaced grid is preferable to truncation because it preserves the full burst
-    time span. If time is unusable, the code falls back to pad/truncate.
-    """
-    missing_channels = [col for col in channel_columns if col not in df.columns]
-    if missing_channels:
-        raise ValueError(f"Missing rate columns: {missing_channels}")
-
-    rates = df[channel_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
-    if rates.size == 0:
-        raise ValueError("Empty light curve")
-
-    if time_column not in df.columns:
-        return pad_or_truncate(np.nan_to_num(rates, nan=0.0), target_length)
-
-    time = pd.to_numeric(df[time_column], errors="coerce").to_numpy(dtype=np.float64)
-    valid_rows = np.isfinite(time)
-    if valid_rows.sum() < 2:
-        return pad_or_truncate(np.nan_to_num(rates, nan=0.0), target_length)
-
-    time = time[valid_rows]
-    rates = rates[valid_rows]
-    order = np.argsort(time)
-    time = time[order]
-    rates = rates[order]
-
-    unique_time, unique_idx = np.unique(time, return_index=True)
-    time = unique_time
-    rates = rates[unique_idx]
-    if time.size < 2 or np.isclose(time[0], time[-1]):
-        return pad_or_truncate(np.nan_to_num(rates, nan=0.0), target_length)
-
-    target_time = np.linspace(time[0], time[-1], target_length)
-    resampled_channels = []
-    for channel_idx in range(rates.shape[1]):
-        channel = rates[:, channel_idx]
-        finite = np.isfinite(channel)
-        if finite.sum() == 0:
-            resampled = np.zeros(target_length, dtype=np.float32)
-        elif finite.sum() == 1:
-            resampled = np.full(target_length, channel[finite][0], dtype=np.float32)
-        else:
-            resampled = np.interp(target_time, time[finite], channel[finite]).astype(np.float32)
-        resampled_channels.append(resampled)
-
-    return np.stack(resampled_channels, axis=1)
 
 
 # main.py: fold creation and DataLoader setup

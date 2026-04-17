@@ -41,7 +41,6 @@ class GRBHDF5Dataset(Dataset):
                 self.channel_columns = [f"channel_{idx}" for idx in range(self.x.shape[2])]
 
             self.label_rule = str(h5.attrs.get("label_rule", "0 short, 1 long"))
-            self.cache_normalization = str(h5.attrs.get("normalize", "unknown"))
 
         if self.x.ndim != 3:
             raise ValueError(f"Expected X to have shape (n, time, channels), got {tuple(self.x.shape)}")
@@ -71,17 +70,47 @@ def decode_h5_string(value) -> str:
     return str(value)
 
 
+class MultiScaleConvBlock(nn.Module):
+    """Parallel 1D convolutions that capture short, medium, and long time scales."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        branch_channels: int,
+        kernel_sizes: tuple[int, ...],
+    ) -> None:
+        super().__init__()
+        branches = []
+        for kernel_size in kernel_sizes:
+            padding = kernel_size // 2
+            branches.append(
+                nn.Sequential(
+                    nn.Conv1d(in_channels, branch_channels, kernel_size=kernel_size, padding=padding),
+                    nn.BatchNorm1d(branch_channels),
+                    nn.ReLU(),
+                )
+            )
+        self.branches = nn.ModuleList(branches)
+        self.fuse = nn.Sequential(
+            nn.Conv1d(branch_channels * len(kernel_sizes), in_channels, kernel_size=1),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = [branch(x) for branch in self.branches]
+        return self.fuse(torch.cat(features, dim=1))
+
+
 class GRBConvNet(nn.Module):
     """1D CNN over time; input is (batch, time, channels)."""
 
     def __init__(self, channels: int, hidden: int, dropout: float) -> None:
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv1d(channels, hidden, kernel_size=7, padding=3),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
+            MultiScaleConvBlock(channels, hidden, kernel_sizes=(3, 5, 7)),
             nn.MaxPool1d(kernel_size=2),
-            nn.Conv1d(hidden, hidden * 2, kernel_size=5, padding=2),
+            nn.Conv1d(channels, hidden * 2, kernel_size=5, padding=2),
             nn.BatchNorm1d(hidden * 2),
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2),

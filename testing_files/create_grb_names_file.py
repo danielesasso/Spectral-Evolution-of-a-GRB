@@ -40,7 +40,6 @@ def get_swift_summary_names(only_with_t90: bool, sort_names: bool) -> list[str]:
 
     return names
 
-
 def keep_downloadable_names(names: list[str], swift_resolution: int) -> tuple[list[str], list[tuple[str, str]]]:
     swift = SWIFT(res=swift_resolution)
     valid_names: list[str] = []
