@@ -1,5 +1,7 @@
 # Spectral Evolution of a GRB
 
+![Short GRB](images/Traveler%20Visits%20GRB%20Short.gif)
+
 Pipeline for building Swift/BAT GRB datasets (ClassiPyGRB), converting them to training-ready HDF5 tensors, and training a CNN classifier for short vs long bursts.
 
 ## Environment
