@@ -24,7 +24,7 @@ pip install ClassiPyGRB==1.0.0 torch torchvision torchaudio tqdm
 Input files are already provided in this repository and are used as the starting point for preprocessing.
 In particular, the raw variable-length cache and associated metadata are treated as fixed input, not regenerated during this workflow.
 
-### 3) Build processed training HDF5
+### Build processed training HDF5
 
 ```bash
 python testing_files/create_swift_processed_h5.py --overwrite
@@ -38,12 +38,6 @@ This file contains fixed-shape tensors for training:
 
 - `X` with shape `(n_grbs, time, channels)`
 - `y`, `t90`, `names`, `channel_columns`
-
-To cap sequence length (recommended if max length is too large):
-
-```bash
-python testing_files/create_swift_processed_h5.py --target-length 2048 --truncate --overwrite
-```
 
 ## Training
 
