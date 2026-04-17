@@ -21,38 +21,8 @@ pip install ClassiPyGRB==1.0.0 torch torchvision torchaudio tqdm
 
 ## Data Pipeline
 
-The workflow is split into three steps:
-
-1. Build GRB name list
-2. Build raw variable-length HDF5
-3. Build processed fixed-shape HDF5 with `X`
-
-### 1) Build names file
-
-```bash
-python testing_files/create_grb_names_file.py
-```
-
-Optional download validation:
-
-```bash
-python testing_files/create_grb_names_file.py --check-downloads
-```
-
-### 2) Build raw HDF5 cache
-
-```bash
-python testing_files/create_classipygrb_hdf5.py --overwrite
-```
-
-Output:
-
-- `data/raw/classipygrb/swift_balanced_lightcurves.h5`
-
-This raw file stores per-GRB variable-length datasets under:
-
-- `lightcurves/<grb_name>/time`
-- `lightcurves/<grb_name>/rates`
+Input files are already provided in this repository and are used as the starting point for preprocessing.
+In particular, the raw variable-length cache and associated metadata are treated as fixed input, not regenerated during this workflow.
 
 ### 3) Build processed training HDF5
 
@@ -108,6 +78,7 @@ Notes:
 - Augmentations are applied only to training batches.
 - Validation/test data remain untouched for fair benchmarking.
 - You can combine multiple augmentation flags in the same run.
+- Augmentation ratios are customizable (for example `0.1`, `0.2`, `0.4`) and can be set per enabled augmentation.
 
 ## Useful Diagnostics
 
