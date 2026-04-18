@@ -190,3 +190,5 @@ testing_files/
 data/raw/classipygrb/*.h5
 data/raw/classipygrb/*.hdf5
 !data/raw/classipygrb/swift_balanced_lightcurves.h5
+data/testing_files/*.py
+data/testing_files/create_grb_names_file.py
