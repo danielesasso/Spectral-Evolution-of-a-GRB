@@ -24,7 +24,7 @@ from functions import (
 class Config:
     project_root: Path = Path(__file__).resolve().parent  # Repository root used to build data paths.
     raw_data_dir: Path = project_root / "data" / "raw"  # Folder containing raw/local cached data.
-    h5_file: Path = raw_data_dir / "classipygrb" / "swift_balanced_lightcurves.h5"  # Default cached GRB dataset.
+    h5_file: Path = project_root / "data" / "processed" / "classipygrb" / "swift.hd5"  # Default training dataset.
 
     k_folds: int = 5  # Cross-validation folds; each GRB is tested once.
     global_normalize: bool = True  # Normalize X in memory using training-fold mean/std only.
@@ -90,7 +90,17 @@ def run_evaluation(model, val_loader, test_loader, device) -> dict[str, float]:
 
 def print_cross_validation_summary(fold_results: list[dict[str, float]]) -> None:
     print("\nCross-validation summary")
-    for metric in ["loss", "accuracy", "precision", "recall", "f1", "threshold"]:
+    for metric in [
+        "loss",
+        "accuracy",
+        "precision",
+        "recall",
+        "specificity",
+        "balanced_accuracy",
+        "f1",
+        "mcc",
+        "threshold",
+    ]:
         values = [result[metric] for result in fold_results]
         metric_mean = mean(values)
         metric_std = stdev(values) if len(values) > 1 else 0.0
@@ -113,6 +123,12 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=CONFIG.epochs)
     parser.add_argument("--k-folds", type=int, default=CONFIG.k_folds)
     parser.add_argument(
+        "--jitter",
+        type=float,
+        default=0.0,
+        help="Jitter augmentation ratio in [0, 1], applied in-memory to the training split only.",
+    )
+    parser.add_argument(
         "--no-global-normalize",
         action="store_true",
         help="Use X values exactly as stored in the HDF5 file.",
@@ -126,19 +142,35 @@ def main() -> None:
     config.epochs = args.epochs
     config.k_folds = args.k_folds
     config.global_normalize = not args.no_global_normalize
+    if args.jitter < 0.0 or args.jitter > 1.0:
+        raise ValueError(f"--jitter must be in [0, 1], got {args.jitter}")
     set_seed(config.seed)
 
-    dataset = GRBHDF5Dataset(args.h5_file)
+    h5_path = args.h5_file
+    if not h5_path.is_absolute() and not h5_path.exists():
+        if h5_path == Path("swift.hd5"):
+            h5_path = config.project_root / "data" / "processed" / "classipygrb" / h5_path.name
+        else:
+            h5_path = config.project_root / h5_path
+
+    if not h5_path.exists():
+        raise FileNotFoundError(
+            f"HDF5 file not found: {h5_path}\n"
+            "Tip: use data/processed/classipygrb/swift.hd5 from the repository root."
+        )
+
+    dataset = GRBHDF5Dataset(h5_path)
     short_count = sum(1 for label in dataset.labels if label == 0)
     long_count = sum(1 for label in dataset.labels if label == 1)
 
-    print(f"HDF5 file: {args.h5_file}")
+    print(f"HDF5 file: {h5_path}")
     print(f"Loaded GRBs: {len(dataset)}")
     print(f"Short GRBs: {short_count}")
     print(f"Long GRBs: {long_count}")
     print(f"Input shape: {tuple(dataset.x.shape)}")
     print(f"Channels: {', '.join(dataset.channel_columns)}")
     print(f"Label rule: {dataset.label_rule}")
+    print(f"Jitter ratio: {args.jitter:.2f}")
 
     device = get_device()
     print(f"Device: {device}")
@@ -156,6 +188,7 @@ def main() -> None:
             seed=config.seed,
             num_workers=config.num_workers,
             global_normalize=config.global_normalize,
+            jitter_ratio=args.jitter,
         )
         model = build_model(config, channels=dataset.num_channels).to(device)
         model = run_training(config, model, train_loader, val_loader, device)

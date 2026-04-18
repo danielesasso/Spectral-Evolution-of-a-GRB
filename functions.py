@@ -158,6 +158,7 @@ def make_fold_dataloaders(
     seed: int,
     num_workers: int,
     global_normalize: bool,
+    jitter_ratio: float = 0.0,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Use one fold for test, the next fold for validation, and the rest for training."""
     if not folds:
@@ -186,6 +187,13 @@ def make_fold_dataloaders(
         train_set = Subset(dataset, train_idx)
         val_set = Subset(dataset, folds[val_fold])
         test_set = Subset(dataset, folds[test_fold])
+
+    if jitter_ratio > 0.0:
+        train_set = JitterAugmentedDataset(
+            train_set,
+            ratio=jitter_ratio,
+            seed=seed + fold_idx,
+        )
 
     train_loader = DataLoader(
         train_set,
@@ -244,6 +252,61 @@ class GlobalNormalizedSubset(Dataset):
         return (x - self.mean) / self.std, y
 
 
+class JitterAugmentedDataset(Dataset):
+    """Append class-balanced jittered samples to a training dataset in memory."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        ratio: float,
+        seed: int,
+        jitter_std: float = 0.02,
+    ) -> None:
+        if ratio < 0.0 or ratio > 1.0:
+            raise ValueError(f"jitter ratio must be in [0, 1], got {ratio}")
+
+        self.dataset = dataset
+        self.ratio = ratio
+        self.jitter_std = jitter_std
+        self.original_len = len(dataset)
+        self.augmented_indices = self._select_augmented_indices(seed)
+
+    def _select_augmented_indices(self, seed: int) -> list[int]:
+        by_class: dict[int, list[int]] = {}
+        for idx in range(self.original_len):
+            _, y = self.dataset[idx]
+            label = int(float(y.item() if hasattr(y, "item") else y))
+            by_class.setdefault(label, []).append(idx)
+
+        rng = random.Random(seed)
+        selected: list[int] = []
+        for class_indices in by_class.values():
+            if not class_indices:
+                continue
+            shuffled = class_indices[:]
+            rng.shuffle(shuffled)
+            class_take = int(len(shuffled) * self.ratio)
+            if self.ratio > 0.0 and class_take == 0:
+                class_take = 1
+            selected.extend(shuffled[:class_take])
+
+        rng.shuffle(selected)
+        return selected
+
+    def __len__(self) -> int:
+        return self.original_len + len(self.augmented_indices)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if idx < self.original_len:
+            return self.dataset[idx]
+
+        base_idx = self.augmented_indices[idx - self.original_len]
+        x, y = self.dataset[base_idx]
+        x = x.clone()
+        x = x + torch.randn_like(x) * self.jitter_std
+        return x, y
+
+
 # main.py: training and evaluation helpers
 def binary_counts(
     logits: torch.Tensor,
@@ -264,12 +327,19 @@ def metrics_from_counts(tp: int, tn: int, fp: int, fn: int) -> dict[str, float]:
     accuracy = (tp + tn) / total if total else 0.0
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    balanced_accuracy = 0.5 * (recall + specificity)
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    mcc_denominator = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    mcc = ((tp * tn) - (fp * fn)) / np.sqrt(mcc_denominator) if mcc_denominator else 0.0
     return {
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
+        "specificity": specificity,
+        "balanced_accuracy": balanced_accuracy,
         "f1": f1,
+        "mcc": mcc,
         "tp": float(tp),
         "tn": float(tn),
         "fp": float(fp),
@@ -494,7 +564,10 @@ def evaluate_model(
     print(f"accuracy: {metrics['accuracy']:.3f}")
     print(f"precision: {metrics['precision']:.3f}")
     print(f"recall: {metrics['recall']:.3f}")
+    print(f"specificity: {metrics['specificity']:.3f}")
+    print(f"balanced accuracy: {metrics['balanced_accuracy']:.3f}")
     print(f"f1: {metrics['f1']:.3f}")
+    print(f"mcc: {metrics['mcc']:.3f}")
     print(f"decision threshold: {threshold:.2f}")
     print("confusion matrix [[TN, FP], [FN, TP]]:")
     print(
