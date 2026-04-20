@@ -159,6 +159,8 @@ def make_fold_dataloaders(
     num_workers: int,
     global_normalize: bool,
     jitter_ratio: float = 0.0,
+    scaling_ratio: float = 0.0,
+    noise_ratio: float = 0.0,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Use one fold for test, the next fold for validation, and the rest for training."""
     if not folds:
@@ -188,10 +190,12 @@ def make_fold_dataloaders(
         val_set = Subset(dataset, folds[val_fold])
         test_set = Subset(dataset, folds[test_fold])
 
-    if jitter_ratio > 0.0:
-        train_set = JitterAugmentedDataset(
+    if jitter_ratio > 0.0 or scaling_ratio > 0.0 or noise_ratio > 0.0:
+        train_set = AugmentedTrainingDataset(
             train_set,
-            ratio=jitter_ratio,
+            jitter_ratio=jitter_ratio,
+            scaling_ratio=scaling_ratio,
+            noise_ratio=noise_ratio,
             seed=seed + fold_idx,
         )
 
@@ -252,26 +256,41 @@ class GlobalNormalizedSubset(Dataset):
         return (x - self.mean) / self.std, y
 
 
-class JitterAugmentedDataset(Dataset):
-    """Append class-balanced jittered samples to a training dataset in memory."""
+class AugmentedTrainingDataset(Dataset):
+    """Append class-balanced augmented samples to a training dataset in memory."""
 
     def __init__(
         self,
         dataset: Dataset,
-        ratio: float,
+        jitter_ratio: float,
+        scaling_ratio: float,
+        noise_ratio: float,
         seed: int,
         jitter_std: float = 0.02,
+        scaling_std: float = 0.1,
+        noise_std: float = 0.03,
     ) -> None:
-        if ratio < 0.0 or ratio > 1.0:
-            raise ValueError(f"jitter ratio must be in [0, 1], got {ratio}")
+        for name, ratio in {
+            "jitter": jitter_ratio,
+            "scaling": scaling_ratio,
+            "noise": noise_ratio,
+        }.items():
+            if ratio < 0.0 or ratio > 1.0:
+                raise ValueError(f"{name} ratio must be in [0, 1], got {ratio}")
 
         self.dataset = dataset
-        self.ratio = ratio
         self.jitter_std = jitter_std
+        self.scaling_std = scaling_std
+        self.noise_std = noise_std
         self.original_len = len(dataset)
-        self.augmented_indices = self._select_augmented_indices(seed)
+        self.augmentation_items = self._build_augmentation_items(
+            jitter_ratio=jitter_ratio,
+            scaling_ratio=scaling_ratio,
+            noise_ratio=noise_ratio,
+            seed=seed,
+        )
 
-    def _select_augmented_indices(self, seed: int) -> list[int]:
+    def _select_augmented_indices(self, ratio: float, seed: int) -> list[int]:
         by_class: dict[int, list[int]] = {}
         for idx in range(self.original_len):
             _, y = self.dataset[idx]
@@ -285,25 +304,58 @@ class JitterAugmentedDataset(Dataset):
                 continue
             shuffled = class_indices[:]
             rng.shuffle(shuffled)
-            class_take = int(len(shuffled) * self.ratio)
-            if self.ratio > 0.0 and class_take == 0:
+            class_take = int(len(shuffled) * ratio)
+            if ratio > 0.0 and class_take == 0:
                 class_take = 1
             selected.extend(shuffled[:class_take])
 
         rng.shuffle(selected)
         return selected
 
+    def _build_augmentation_items(
+        self,
+        jitter_ratio: float,
+        scaling_ratio: float,
+        noise_ratio: float,
+        seed: int,
+    ) -> list[tuple[int, str]]:
+        items: list[tuple[int, str]] = []
+
+        if jitter_ratio > 0.0:
+            jitter_indices = self._select_augmented_indices(jitter_ratio, seed + 1)
+            items.extend((index, "jitter") for index in jitter_indices)
+
+        if scaling_ratio > 0.0:
+            scaling_indices = self._select_augmented_indices(scaling_ratio, seed + 2)
+            items.extend((index, "scaling") for index in scaling_indices)
+
+        if noise_ratio > 0.0:
+            noise_indices = self._select_augmented_indices(noise_ratio, seed + 3)
+            items.extend((index, "noise") for index in noise_indices)
+
+        rng = random.Random(seed)
+        rng.shuffle(items)
+        return items
+
     def __len__(self) -> int:
-        return self.original_len + len(self.augmented_indices)
+        return self.original_len + len(self.augmentation_items)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         if idx < self.original_len:
             return self.dataset[idx]
 
-        base_idx = self.augmented_indices[idx - self.original_len]
+        base_idx, transform = self.augmentation_items[idx - self.original_len]
         x, y = self.dataset[base_idx]
         x = x.clone()
-        x = x + torch.randn_like(x) * self.jitter_std
+        if transform == "jitter":
+            x = x + torch.randn_like(x) * self.jitter_std
+        elif transform == "scaling":
+            scale = torch.clamp(torch.randn(1, device=x.device) * self.scaling_std + 1.0, min=0.1)
+            x = x * scale
+        elif transform == "noise":
+            x = x + torch.randn_like(x) * self.noise_std
+        else:
+            raise ValueError(f"Unknown augmentation transform: {transform}")
         return x, y
 
 

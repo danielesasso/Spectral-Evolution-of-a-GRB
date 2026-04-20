@@ -129,6 +129,18 @@ def parse_args():
         help="Jitter augmentation ratio in [0, 1], applied in-memory to the training split only.",
     )
     parser.add_argument(
+        "--scaling",
+        type=float,
+        default=0.0,
+        help="Scaling augmentation ratio in [0, 1], applied in-memory to the training split only.",
+    )
+    parser.add_argument(
+        "--noise",
+        type=float,
+        default=0.0,
+        help="Noise augmentation ratio in [0, 1], applied in-memory to the training split only.",
+    )
+    parser.add_argument(
         "--no-global-normalize",
         action="store_true",
         help="Use X values exactly as stored in the HDF5 file.",
@@ -142,8 +154,13 @@ def main() -> None:
     config.epochs = args.epochs
     config.k_folds = args.k_folds
     config.global_normalize = not args.no_global_normalize
-    if args.jitter < 0.0 or args.jitter > 1.0:
-        raise ValueError(f"--jitter must be in [0, 1], got {args.jitter}")
+    for flag_name, flag_value in {
+        "--jitter": args.jitter,
+        "--scaling": args.scaling,
+        "--noise": args.noise,
+    }.items():
+        if flag_value < 0.0 or flag_value > 1.0:
+            raise ValueError(f"{flag_name} must be in [0, 1], got {flag_value}")
     set_seed(config.seed)
 
     h5_path = args.h5_file
@@ -171,6 +188,8 @@ def main() -> None:
     print(f"Channels: {', '.join(dataset.channel_columns)}")
     print(f"Label rule: {dataset.label_rule}")
     print(f"Jitter ratio: {args.jitter:.2f}")
+    print(f"Scaling ratio: {args.scaling:.2f}")
+    print(f"Noise ratio: {args.noise:.2f}")
 
     device = get_device()
     print(f"Device: {device}")
@@ -189,6 +208,8 @@ def main() -> None:
             num_workers=config.num_workers,
             global_normalize=config.global_normalize,
             jitter_ratio=args.jitter,
+            scaling_ratio=args.scaling,
+            noise_ratio=args.noise,
         )
         model = build_model(config, channels=dataset.num_channels).to(device)
         model = run_training(config, model, train_loader, val_loader, device)
