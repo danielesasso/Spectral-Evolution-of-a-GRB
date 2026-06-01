@@ -119,6 +119,76 @@ def dataset_labels(dataset: Dataset) -> list[int] | None:
     return labels
 
 
+class TrimTrailingZeroPaddingDataset(Dataset):
+    """Expose HDF5 light curves with trailing all-zero padding removed per sample."""
+
+    def __init__(self, dataset: Dataset, eps: float = 0.0) -> None:
+        self.dataset = dataset
+        self.eps = eps
+        self.labels = list(getattr(dataset, "labels", []))
+        self.names = list(getattr(dataset, "names", []))
+        self.t90 = list(getattr(dataset, "t90", []))
+        self.channel_columns = list(getattr(dataset, "channel_columns", []))
+        self.label_rule = str(getattr(dataset, "label_rule", "0 short, 1 long"))
+
+        self.lengths: list[int] = []
+        self.samples = []
+        for idx in range(len(dataset)):
+            x, y = dataset[idx]
+            trimmed = trim_trailing_zero_padding(x, eps=eps)
+            self.lengths.append(int(trimmed.shape[0]))
+            name = self.names[idx] if idx < len(self.names) else str(idx)
+            t90 = self.t90[idx] if idx < len(self.t90) else float("nan")
+            self.samples.append((trimmed, y, name, t90))
+
+    @property
+    def num_channels(self) -> int:
+        if self.channel_columns:
+            return len(self.channel_columns)
+        first_x, _ = self[0]
+        return int(first_x.shape[1])
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.dataset[idx]
+        return trim_trailing_zero_padding(x, eps=self.eps), y
+
+
+def trim_trailing_zero_padding(x: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+    """Remove only trailing time rows whose channels are all zero padding."""
+    row_has_signal = x.abs().gt(eps).any(dim=1)
+    nonzero_indices = torch.nonzero(row_has_signal, as_tuple=False).flatten()
+    if nonzero_indices.numel() == 0:
+        return x[:1]
+    last_signal_idx = int(nonzero_indices[-1].item())
+    return x[: last_signal_idx + 1]
+
+
+def remove_trailing_zero_padding(dataset: Dataset, eps: float = 0.0) -> TrimTrailingZeroPaddingDataset:
+    """Build a variable-length dataset by removing right-padding already stored in HDF5."""
+    return TrimTrailingZeroPaddingDataset(dataset, eps=eps)
+
+
+def summarize_sequence_lengths(dataset: Dataset) -> dict[str, float]:
+    """Return a compact summary of per-sample sequence lengths."""
+    lengths = getattr(dataset, "lengths", None)
+    if lengths is None:
+        x_values = getattr(dataset, "x", None)
+        if x_values is None:
+            lengths = [int(dataset[idx][0].shape[0]) for idx in range(len(dataset))]
+        else:
+            lengths = [int(x_values.shape[1])] * len(dataset)
+
+    values = np.asarray(lengths, dtype=np.float64)
+    return {
+        "min": float(values.min()),
+        "median": float(np.median(values)),
+        "max": float(values.max()),
+    }
+
+
 def make_stratified_folds(dataset: Dataset, k_folds: int, seed: int) -> list[list[int]]:
     """Create class-balanced folds for cross-validation."""
     if k_folds < 3:
@@ -220,12 +290,14 @@ def make_global_normalized_subsets(
 ) -> tuple[Dataset, Dataset, Dataset]:
     """Normalize X with mean/std computed from training GRBs only."""
     x_values = getattr(dataset, "x", None)
-    if x_values is None:
-        raise ValueError("Global normalization requires the dataset to expose an x tensor")
-
-    train_x = x_values[train_idx]
-    mean = train_x.mean(dim=(0, 1)).view(1, -1)
-    std = train_x.std(dim=(0, 1), unbiased=False).view(1, -1)
+    if x_values is not None:
+        train_x = x_values[train_idx]
+        mean = train_x.mean(dim=(0, 1)).view(1, -1)
+        std = train_x.std(dim=(0, 1), unbiased=False).view(1, -1)
+    else:
+        train_x = torch.cat([dataset[idx][0] for idx in train_idx], dim=0)
+        mean = train_x.mean(dim=0).view(1, -1)
+        std = train_x.std(dim=0, unbiased=False).view(1, -1)
     std = torch.where(std < eps, torch.ones_like(std), std)
 
     return (

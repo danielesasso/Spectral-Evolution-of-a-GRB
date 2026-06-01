@@ -78,22 +78,24 @@ class MultiScaleConvBlock(nn.Module):
         in_channels: int,
         branch_channels: int,
         kernel_sizes: tuple[int, ...],
+        normalization: str = "batch",
     ) -> None:
         super().__init__()
+        norm = make_norm1d(normalization)
         branches = []
         for kernel_size in kernel_sizes:
             padding = kernel_size // 2
             branches.append(
                 nn.Sequential(
                     nn.Conv1d(in_channels, branch_channels, kernel_size=kernel_size, padding=padding),
-                    nn.BatchNorm1d(branch_channels),
+                    norm(branch_channels),
                     nn.ReLU(),
                 )
             )
         self.branches = nn.ModuleList(branches)
         self.fuse = nn.Sequential(
             nn.Conv1d(branch_channels * len(kernel_sizes), in_channels, kernel_size=1),
-            nn.BatchNorm1d(in_channels),
+            norm(in_channels),
             nn.ReLU(),
         )
 
@@ -105,17 +107,30 @@ class MultiScaleConvBlock(nn.Module):
 class GRBConvNet(nn.Module):
     """1D CNN over time; input is (batch, time, channels)."""
 
-    def __init__(self, channels: int, hidden: int, dropout: float) -> None:
+    def __init__(
+        self,
+        channels: int,
+        hidden: int,
+        dropout: float,
+        normalization: str = "batch",
+        ceil_pooling: bool = False,
+    ) -> None:
         super().__init__()
+        norm = make_norm1d(normalization)
         self.features = nn.Sequential(
-            MultiScaleConvBlock(channels, hidden, kernel_sizes=(3, 5, 7)),
-            nn.MaxPool1d(kernel_size=2),
+            MultiScaleConvBlock(
+                channels,
+                hidden,
+                kernel_sizes=(3, 5, 7),
+                normalization=normalization,
+            ),
+            nn.MaxPool1d(kernel_size=2, ceil_mode=ceil_pooling),
             nn.Conv1d(channels, hidden * 2, kernel_size=5, padding=2),
-            nn.BatchNorm1d(hidden * 2),
+            norm(hidden * 2),
             nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
+            nn.MaxPool1d(kernel_size=2, ceil_mode=ceil_pooling),
             nn.Conv1d(hidden * 2, hidden * 4, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden * 4),
+            norm(hidden * 4),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(1),
         )
@@ -129,3 +144,11 @@ class GRBConvNet(nn.Module):
         x = x.transpose(1, 2)  # (batch, time, channels) -> (batch, channels, time)
         logits = self.classifier(self.features(x))
         return logits.squeeze(1)
+
+
+def make_norm1d(normalization: str):
+    if normalization == "batch":
+        return nn.BatchNorm1d
+    if normalization == "group":
+        return lambda channels: nn.GroupNorm(num_groups=1, num_channels=channels)
+    raise ValueError(f"Unknown normalization: {normalization}")

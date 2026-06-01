@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, stdev
 
+import torch
+
 from classes import GRBConvNet, GRBHDF5Dataset
 from functions import (
     evaluate_model,
@@ -10,7 +12,9 @@ from functions import (
     get_device,
     make_fold_dataloaders,
     make_stratified_folds,
+    remove_trailing_zero_padding,
     set_seed,
+    summarize_sequence_lengths,
     train_model,
 )
 
@@ -38,6 +42,7 @@ class Config:
 
     hidden_channels: int = 32  # CNN width; larger can learn more but overfits more easily.
     dropout: float = 0.2  # Fraction of classifier activations dropped during training.
+    no_padding: bool = False  # Remove fixed HDF5 padding and use variable-length samples.
 
 
 CONFIG = Config()
@@ -52,6 +57,8 @@ def build_model(config: Config, channels: int):
         channels=channels,
         hidden=config.hidden_channels,
         dropout=config.dropout,
+        normalization="group" if config.no_padding else "batch",
+        ceil_pooling=config.no_padding,
     )
 
 
@@ -145,6 +152,16 @@ def parse_args():
         action="store_true",
         help="Use X values exactly as stored in the HDF5 file.",
     )
+    parser.add_argument(
+        "--nopadding",
+        "--nopaddiong",
+        dest="no_padding",
+        action="store_true",
+        help=(
+            "Remove trailing all-zero padding from each HDF5 sample. "
+            "This uses batch size 1 so batches do not reintroduce padding."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -154,6 +171,7 @@ def main() -> None:
     config.epochs = args.epochs
     config.k_folds = args.k_folds
     config.global_normalize = not args.no_global_normalize
+    config.no_padding = args.no_padding
     for flag_name, flag_value in {
         "--jitter": args.jitter,
         "--scaling": args.scaling,
@@ -177,21 +195,37 @@ def main() -> None:
         )
 
     dataset = GRBHDF5Dataset(h5_path)
+    if args.no_padding:
+        dataset = remove_trailing_zero_padding(dataset)
+
     short_count = sum(1 for label in dataset.labels if label == 0)
     long_count = sum(1 for label in dataset.labels if label == 1)
+    length_summary = summarize_sequence_lengths(dataset)
+    effective_batch_size = 1 if args.no_padding else config.batch_size
 
     print(f"HDF5 file: {h5_path}")
     print(f"Loaded GRBs: {len(dataset)}")
     print(f"Short GRBs: {short_count}")
     print(f"Long GRBs: {long_count}")
-    print(f"Input shape: {tuple(dataset.x.shape)}")
+    if hasattr(dataset, "x"):
+        print(f"Input shape: {tuple(dataset.x.shape)}")
+    else:
+        print("Input shape: variable length, no trailing zero padding")
+    print(
+        "Sequence length: "
+        f"min={length_summary['min']:.0f}, "
+        f"median={length_summary['median']:.0f}, "
+        f"max={length_summary['max']:.0f}"
+    )
     print(f"Channels: {', '.join(dataset.channel_columns)}")
     print(f"Label rule: {dataset.label_rule}")
+    print(f"No padding mode: {args.no_padding}")
+    print(f"Batch size: {effective_batch_size}")
     print(f"Jitter ratio: {args.jitter:.2f}")
     print(f"Scaling ratio: {args.scaling:.2f}")
     print(f"Noise ratio: {args.noise:.2f}")
 
-    device = get_device()
+    device = torch.device("cpu") if args.no_padding else get_device()
     print(f"Device: {device}")
 
     folds = make_stratified_folds(dataset, k_folds=config.k_folds, seed=config.seed)
@@ -203,7 +237,7 @@ def main() -> None:
             dataset,
             folds=folds,
             fold_idx=fold_idx,
-            batch_size=config.batch_size,
+            batch_size=effective_batch_size,
             seed=config.seed,
             num_workers=config.num_workers,
             global_normalize=config.global_normalize,
